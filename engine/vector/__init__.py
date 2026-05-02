@@ -9,16 +9,19 @@ Usage:
     store.add_chunks_batch([{"chunk_id": "a:0", ...}])   # no embedding needed
     results = store.search("my query")                    # text in, SearchResult out
 
-    # FAISS (fast ANN, good for >1K chunks)
-    store = VectorStoreFactory.create("faiss")
-
 Backends:
     - sqlite: SQLite with in-memory caching (default)
-    - faiss: Facebook AI Similarity Search (high performance)
-    - hnsw: Hierarchical Navigable Small World (future)
+    - sqlite_vec: sqlite-vec extension (Phase 2, optional)
+    - faiss: Facebook AI Similarity Search (Phase 2, optional)
+
+Exception contract:
+    VectorStoreFactory.create() raises:
+    - ValueError:   backend name is completely unknown
+    - ImportError:  backend is known but its optional dependency is not installed
 """
 
 import inspect
+import os
 from typing import Optional, List
 
 import numpy as np
@@ -26,13 +29,11 @@ import numpy as np
 from engine.vector.base import BaseVectorStore, SearchResult
 from engine.vector.sqlite_store import SQLiteVectorStore
 
-# Optional: FAISS backend (only if installed)
-try:
-    from engine.vector.faiss_store import FAISSVectorStore
-    _FAISS_AVAILABLE = True
-except (ImportError, ModuleNotFoundError, NameError):
-    _FAISS_AVAILABLE = False
-
+# Phase 2: Optional backends — loaded lazily via env var
+_OPTIONAL_BACKENDS = {
+    "sqlite_vec": ("engine.vector.sqlite_vec_store", "SQLiteVecVectorStore", "sqlite-vec"),
+    "faiss": ("engine.vector.faiss_store", "FAISSVectorStore", "faiss-cpu"),
+}
 
 class VectorStore:
     """
@@ -127,39 +128,55 @@ class VectorStoreFactory:
         "sqlite": SQLiteVectorStore,
     }
 
-    # Register FAISS if available
-    if _FAISS_AVAILABLE:
-        _backends["faiss"] = FAISSVectorStore
+    @classmethod
+    def _load_optional_backend(cls, name: str):
+        """Lazy-load an optional backend by name."""
+        if name not in _OPTIONAL_BACKENDS:
+            return None
+        module_path, class_name, pkg = _OPTIONAL_BACKENDS[name]
+        try:
+            module = __import__(module_path, fromlist=[class_name])
+            backend_class = getattr(module, class_name)
+            cls._backends[name] = backend_class
+            return backend_class
+        except (ImportError, AttributeError) as e:
+            raise ImportError(
+                f"Backend '{name}' requires {pkg}. "
+                f"Run: pip install {pkg}"
+            ) from e
 
     @classmethod
-    def create(cls, backend_type: str = "sqlite",
+    def create(cls, backend_type: str = None,
                embedder=None, **kwargs) -> VectorStore:
         """
         Create a text-first VectorStore facade.
 
         Args:
-            backend_type: ``"sqlite"`` (default) or ``"faiss"``.
+            backend_type: ``"sqlite"`` (default). Optional backends loaded lazily.
             embedder: Optional pre-built Embedder.  A new one is created when
                       omitted.  Passed to the facade, *not* to the backend.
             **kwargs: Backend-specific keyword arguments (e.g. ``db_path`` for
-                      SQLite, ``index_type`` for FAISS).  Unknown keys for the
-                      chosen backend are filtered out automatically.
+                      SQLite).  Unknown keys are filtered out automatically.
 
         Returns:
             :class:`VectorStore` facade ready for text-first operations.
 
         Raises:
             ValueError: If ``backend_type`` is not registered.
-            ImportError: If FAISS is requested but not installed.
+            ImportError: If optional backend is requested but not installed.
         """
-        backend_type = backend_type.lower()
+        # Default from env var, fallback to "sqlite"
+        backend_type = (backend_type or os.environ.get("VECTOR_BACKEND", "sqlite")).lower()
 
         if backend_type not in cls._backends:
-            available = ", ".join(cls._backends.keys())
-            raise ValueError(
-                f"Unknown backend: '{backend_type}'. "
-                f"Available: {available}"
-            )
+            # Try to lazy-load optional backend
+            backend_class = cls._load_optional_backend(backend_type)
+            if backend_class is None:
+                available = ", ".join(cls._backends.keys())
+                raise ValueError(
+                    f"Unknown backend: '{backend_type}'. "
+                    f"Available: {available}"
+                )
 
         backend_class = cls._backends[backend_type]
 
