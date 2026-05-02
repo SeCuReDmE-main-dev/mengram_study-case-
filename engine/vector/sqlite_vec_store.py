@@ -1,8 +1,7 @@
 """
 SQLiteVecVectorStore — Phase 2 backend using sqlite-vec extension.
 
-Leverages the sqlite-vec extension for GPU-accelerated vector search.
-Provides significant performance improvements over pure SQLite implementation.
+Leverages the sqlite-vec extension for ANN vector search in SQLite.
 """
 
 import sqlite3
@@ -19,9 +18,9 @@ class SQLiteVecVectorStore(BaseVectorStore):
     SQLite-based vector storage with sqlite-vec extension for fast ANN search.
     
     Uses the sqlite-vec extension which provides:
-    - vec0() table-valued function for vector search
+    - vec0() virtual table for vector storage
     - vec_distance_cosine() for cosine distance calculations
-    - Significant performance improvements over brute-force search
+    - MATCH operator for approximate nearest-neighbor search
     
     Suitable for vaults of 10K+ notes with maintained accuracy.
     """
@@ -36,13 +35,10 @@ class SQLiteVecVectorStore(BaseVectorStore):
         self._create_tables()
 
     def _enable_vec_extension(self):
-        """Enable the sqlite-vec extension."""
+        """Enable the sqlite-vec extension using platform-safe loader."""
         try:
-            import sqlite_vec
-            import pathlib
-            ext_path = pathlib.Path(sqlite_vec.__file__).parent / "vec0.dll"
             self.conn.enable_load_extension(True)
-            self.conn.load_extension(str(ext_path))
+            sqlite_vec.load(self.conn)
             self.conn.enable_load_extension(False)
         except Exception as e:
             raise RuntimeError(
@@ -51,7 +47,9 @@ class SQLiteVecVectorStore(BaseVectorStore):
             ) from e
 
     def _create_tables(self):
-        self.conn.executescript("""
+        # Build vec0 schema dynamically from configured dimension
+        vec_dim_sql = f"embedding float[{self.dimension}]"
+        self.conn.executescript(f"""
             CREATE TABLE IF NOT EXISTS chunks (
                 id TEXT PRIMARY KEY,
                 entity_id TEXT NOT NULL,
@@ -64,7 +62,7 @@ class SQLiteVecVectorStore(BaseVectorStore):
             );
 
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(
-                embedding float[384]
+                {vec_dim_sql}
             );
             
             CREATE TABLE IF NOT EXISTS vec_map (
@@ -77,91 +75,117 @@ class SQLiteVecVectorStore(BaseVectorStore):
         """)
         self.conn.commit()
 
+    def _serialize_vec(self, vector: np.ndarray) -> bytes:
+        """Validate, normalize, and serialize a vector to bytes."""
+        v = self._validate_embedding(vector)
+        return sqlite_vec.serialize_float32(v)
+
     def add_chunk(self, chunk_id: str, entity_id: str, entity_name: str,
                   section: str, content: str, embedding: np.ndarray,
                   position: int = 0) -> None:
         """Add single chunk with embedding (already computed externally)"""
-        vector = self._validate_embedding(embedding)
-        
-        # Insert into main chunks table
+        serialized = self._serialize_vec(embedding)
+
+        # Delete previous vec_items row for this chunk_id (if any) to prevent orphans
+        self.conn.execute("""
+            DELETE FROM vec_items 
+            WHERE rowid IN (
+                SELECT v.rowid FROM vec_items v
+                JOIN vec_map m ON v.rowid = m.rowid
+                WHERE m.chunk_id = ?
+            )
+        """, (chunk_id,))
+
+        # Upsert chunks + vec_map
         self.conn.execute(
             """INSERT OR REPLACE INTO chunks 
                (id, entity_id, entity_name, section, content, embedding, position)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (chunk_id, entity_id, entity_name, section, content,
-             sqlite_vec.serialize_float32(vector), position),
+             serialized, position),
         )
-        
-        # Get the rowid for the inserted chunk
+
         cursor = self.conn.execute("SELECT last_insert_rowid()")
         rowid = cursor.fetchone()[0]
-        
-        # Insert into vec_map to link chunks with vec_items
+
         self.conn.execute(
             """INSERT OR REPLACE INTO vec_map (rowid, chunk_id)
                VALUES (?, ?)""",
             (rowid, chunk_id),
         )
-        
-        # Insert the vector into the vec0 virtual table
+
+        # INSERT OR REPLACE into vec_items (idempotent)
         self.conn.execute(
-            """INSERT INTO vec_items (rowid, embedding)
+            """INSERT OR REPLACE INTO vec_items (rowid, embedding)
                VALUES (?, ?)""",
-            (rowid, sqlite_vec.serialize_float32(vector)),
+            (rowid, serialized),
         )
-        
+
         self.conn.commit()
 
     def add_chunks_batch(self, chunks: List[dict]) -> None:
-        """Batch-add chunks for efficient indexing"""
+        """Batch-add chunks with a single rowid lookup query."""
         if not chunks:
             return
 
-        # Insert all chunks into main table
-        rows = []
+        # Serialize once per chunk — avoids double validation
+        chunk_data = []
         for c in chunks:
             emb = self._validate_embedding(c["embedding"])
-            rows.append((
-                c["chunk_id"], c["entity_id"], c["entity_name"],
-                c["section"], c["content"], sqlite_vec.serialize_float32(emb),
-                c.get("position", 0)
-            ))
+            ser = sqlite_vec.serialize_float32(emb)
+            chunk_data.append({
+                "chunk_id": c["chunk_id"],
+                "entity_id": c["entity_id"],
+                "entity_name": c["entity_name"],
+                "section": c["section"],
+                "content": c["content"],
+                "position": c.get("position", 0),
+                "serialized": ser,
+            })
 
+        # Upsert all chunks
         self.conn.executemany(
             """INSERT OR REPLACE INTO chunks 
                (id, entity_id, entity_name, section, content, embedding, position)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            rows,
+            [(c["chunk_id"], c["entity_id"], c["entity_name"],
+              c["section"], c["content"], c["serialized"], c["position"])
+             for c in chunk_data],
         )
         self.conn.commit()
-        
-        # Now get rowids and insert into vec_map + vec_items
-        vec_rows = []
+
+        # Single batch query for all rowids (fixes N+1)
+        chunk_ids = [c["chunk_id"] for c in chunk_data]
+        placeholders = ",".join("?" * len(chunk_ids))
+        id_to_rowid = {
+            r["id"]: r["rowid"]
+            for r in self.conn.execute(
+                f"SELECT id, rowid FROM chunks WHERE id IN ({placeholders})",
+                chunk_ids,
+            ).fetchall()
+        }
+
+        # Build map/vec rows from the single lookup
         map_rows = []
-        for c in chunks:
-            emb = self._validate_embedding(c["embedding"])
-            cursor = self.conn.execute(
-                "SELECT rowid FROM chunks WHERE id = ?",
-                (c["chunk_id"],)
-            )
-            row = cursor.fetchone()
-            if row:
-                rowid = row[0]
+        vec_rows = []
+        for c in chunk_data:
+            rowid = id_to_rowid.get(c["chunk_id"])
+            if rowid is not None:
                 map_rows.append((rowid, c["chunk_id"]))
-                vec_rows.append((rowid, sqlite_vec.serialize_float32(emb)))
-        
-        self.conn.executemany(
-            """INSERT OR REPLACE INTO vec_map (rowid, chunk_id)
-               VALUES (?, ?)""",
-            map_rows,
-        )
-        
-        self.conn.executemany(
-            """INSERT INTO vec_items (rowid, embedding)
-               VALUES (?, ?)""",
-            vec_rows,
-        )
-        
+                vec_rows.append((rowid, c["serialized"]))
+
+        if map_rows:
+            self.conn.executemany(
+                """INSERT OR REPLACE INTO vec_map (rowid, chunk_id)
+                   VALUES (?, ?)""",
+                map_rows,
+            )
+            self.conn.executemany(
+                """INSERT OR REPLACE INTO vec_items (rowid, embedding)
+                   VALUES (?, ?)""",
+                vec_rows,
+            )
+
         self.conn.commit()
         print(f"   [OK] Indexed {len(chunks)} chunks (SQLite-Vec)")
 
@@ -170,13 +194,11 @@ class SQLiteVecVectorStore(BaseVectorStore):
         """Semantic search using sqlite-vec extension"""
         if top_k <= 0:
             return []
-            
-        # Validate and normalize query embedding
+
         query_vec = self._validate_embedding(query_embedding)
-        
-        # Use sqlite-vec for vector search
-        # vec_distance_cosine returns distance (0 = identical, 2 = opposite)
-        # We want similarity, so: similarity = 1 - distance/2
+        serialized_q = sqlite_vec.serialize_float32(query_vec)
+
+        # Use score alias in ORDER BY — avoids redundant vec_distance_cosine call
         cursor = self.conn.execute("""
             SELECT 
                 c.id,
@@ -188,10 +210,10 @@ class SQLiteVecVectorStore(BaseVectorStore):
             FROM vec_items v
             JOIN vec_map m ON v.rowid = m.rowid
             JOIN chunks c ON m.chunk_id = c.id
-            ORDER BY vec_distance_cosine(v.embedding, ?)
+            ORDER BY score DESC
             LIMIT ?
-        """, (sqlite_vec.serialize_float32(query_vec), sqlite_vec.serialize_float32(query_vec), top_k))
-        
+        """, (serialized_q, top_k))
+
         results = []
         for row in cursor.fetchall():
             score = float(row["score"])
@@ -204,7 +226,7 @@ class SQLiteVecVectorStore(BaseVectorStore):
                     content=row["content"],
                     score=score,
                 ))
-        
+
         return results
 
     def search_by_entity(self, entity_id: str) -> List[dict]:
@@ -237,7 +259,6 @@ class SQLiteVecVectorStore(BaseVectorStore):
 
     def delete_entity(self, entity_id: str) -> None:
         """Remove all chunks for a given entity."""
-        # Delete from vec_items first (through vec_map)
         self.conn.execute("""
             DELETE FROM vec_items 
             WHERE rowid IN (
@@ -248,16 +269,14 @@ class SQLiteVecVectorStore(BaseVectorStore):
                 WHERE c.entity_id = ?
             )
         """, (entity_id,))
-        
-        # Delete from vec_map
+
         self.conn.execute("""
             DELETE FROM vec_map
             WHERE chunk_id IN (
                 SELECT id FROM chunks WHERE entity_id = ?
             )
         """, (entity_id,))
-        
-        # Delete from chunks
+
         self.conn.execute(
             "DELETE FROM chunks WHERE entity_id = ?", (entity_id,)
         )
