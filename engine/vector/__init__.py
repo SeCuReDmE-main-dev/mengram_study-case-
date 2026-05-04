@@ -12,7 +12,6 @@ Usage:
 Backends:
     - sqlite: SQLite with in-memory caching (default)
     - sqlite_vec: sqlite-vec extension (Phase 2, optional)
-    - faiss: Facebook AI Similarity Search (Phase 2, optional)
 
 Exception contract:
     VectorStoreFactory.create() raises:
@@ -32,7 +31,6 @@ from engine.vector.sqlite_store import SQLiteVectorStore
 # Phase 2: Optional backends — loaded lazily via env var
 _OPTIONAL_BACKENDS = {
     "sqlite_vec": ("engine.vector.sqlite_vec_store", "SQLiteVecVectorStore", "sqlite-vec"),
-    "faiss": ("engine.vector.faiss_store", "FAISSVectorStore", "faiss-cpu"),
 }
 
 class VectorStore:
