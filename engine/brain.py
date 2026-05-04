@@ -13,6 +13,7 @@ Two main actions:
 - recall(query) → semantic search + graph → context
 """
 
+import os
 import re
 import yaml
 import sys
@@ -70,15 +71,14 @@ class MengramBrain:
             print("🧠 Initializing semantic search...", file=sys.stderr)
             embedder = Embedder()
 
-            # Choose backend from config (default: sqlite)
-            backend_type = getattr(self, '_vector_backend', 'sqlite')
-            
+            # Backend selected via VECTOR_BACKEND env var (default: sqlite)
             self._vector_store = VectorStoreFactory.create(
-                backend_type,
+                None,  # factory reads VECTOR_BACKEND env var
                 db_path=self._vector_db_path,
                 embedder=embedder,
             )
-            print(f"   ✅ Using {backend_type} backend", file=sys.stderr)
+            backend_name = os.environ.get("VECTOR_BACKEND", "sqlite")
+            print(f"   ✅ Using {backend_name} backend", file=sys.stderr)
 
             # Auto-sync: index only new/missing entities
             stats = self._vector_store.stats()
