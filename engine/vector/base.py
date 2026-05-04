@@ -1,13 +1,13 @@
 """
-BaseVectorStore — Abstract interface for pluggable vector backends.
+BaseVectorStore — Abstract interface for local vector backends.
 
-All vector storage backends (SQLite, FAISS, HNSW, etc.) must implement this interface.
+Vector storage backends must implement this interface.
 This enables swapping backends without changing Brain or retrieval logic.
 """
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import List
 import numpy as np
 
 
@@ -109,7 +109,7 @@ class BaseVectorStore(ABC):
         Return store statistics.
         
         Returns:
-            Dict with keys like: total_chunks, total_entities, backend_type
+            Dict with store statistics such as total_chunks and total_entities.
         """
         pass
 
@@ -141,14 +141,16 @@ class BaseVectorStore(ABC):
         pass
 
     def _validate_embedding(self, embedding: np.ndarray) -> np.ndarray:
-        """Validate and normalize embedding vector"""
+        """Validate, normalize, and cast to float32."""
         if embedding.shape[0] != self.dimension:
             raise ValueError(
                 f"Embedding dimension mismatch: expected {self.dimension}, "
                 f"got {embedding.shape[0]}"
             )
-        # Normalize for cosine similarity
-        norm = np.linalg.norm(embedding)
+        # Always return float32 — dividing by a float64 norm would upcast
+        # to float64, doubling the byte length stored/loaded from SQLite.
+        v = embedding.astype(np.float32)
+        norm = np.linalg.norm(v)
         if norm > 0:
-            return embedding / norm
-        return embedding
+            return (v / norm).astype(np.float32)
+        return v

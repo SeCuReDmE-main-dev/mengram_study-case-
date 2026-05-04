@@ -5,20 +5,11 @@ Migrates the original VectorStore logic to the pluggable interface.
 Uses SQLite with in-memory caching for fast cosine similarity search.
 """
 
-import json
 import sqlite3
 import numpy as np
 from typing import Optional, List
 
 from engine.vector.base import BaseVectorStore, SearchResult
-
-# Optional embedder (may not be installed in all environments)
-try:
-    from engine.vector.embedder import Embedder
-    _EMBEDDER_AVAILABLE = True
-except ImportError:
-    _EMBEDDER_AVAILABLE = False
-    Embedder = None
 
 
 class SQLiteVectorStore(BaseVectorStore):
@@ -26,7 +17,6 @@ class SQLiteVectorStore(BaseVectorStore):
     SQLite-based vector storage with cosine similarity.
     
     Sufficient for vaults up to ~10K notes.
-    At scale, switch to FAISS or HNSW backends.
     """
 
     def __init__(self, db_path: str = ":memory:", embedder=None,
@@ -95,7 +85,6 @@ class SQLiteVectorStore(BaseVectorStore):
         )
         self.conn.commit()
         self._invalidate_cache()
-        print(f"   ✅ Indexed {len(chunks)} chunks (SQLite)")
 
     def search(self, query_embedding: np.ndarray, top_k: int = 5,
                min_score: float = 0.0) -> List[SearchResult]:
@@ -114,17 +103,35 @@ class SQLiteVectorStore(BaseVectorStore):
         # Top-K
         top_indices = np.argsort(scores)[::-1][:top_k]
 
-        results = []
+        # Collect candidate chunk_ids and scores in score order
+        candidates = []
         for idx in top_indices:
             score = float(scores[idx])
             if score < min_score:
                 break
+            candidates.append((self._chunk_ids[idx], score))
 
-            chunk_id = self._chunk_ids[idx]
-            row = self.conn.execute(
-                "SELECT * FROM chunks WHERE id = ?", (chunk_id,)
-            ).fetchone()
+        if not candidates:
+            return []
 
+        # Batch fetch all rows in one query — avoids N+1 per-loop SELECT
+        # Chunk into batches of 900 to stay under SQLite 999 parameter limit
+        candidate_ids = [c[0] for c in candidates]
+        row_by_id = {}
+        SQLITE_MAX_PARAMS = 900
+        for i in range(0, len(candidate_ids), SQLITE_MAX_PARAMS):
+            batch = candidate_ids[i:i + SQLITE_MAX_PARAMS]
+            placeholders = ",".join("?" * len(batch))
+            rows = self.conn.execute(
+                f"SELECT * FROM chunks WHERE id IN ({placeholders})",
+                batch,
+            ).fetchall()
+            for r in rows:
+                row_by_id[r["id"]] = r
+
+        results = []
+        for chunk_id, score in candidates:
+            row = row_by_id.get(chunk_id)
             if row:
                 results.append(SearchResult(
                     chunk_id=row["id"],

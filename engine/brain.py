@@ -62,7 +62,7 @@ class MengramBrain:
         return self._vector_store
 
     def _init_vector_store(self):
-        """Initialize vector store with configurable backend"""
+        """Initialize vector store."""
         try:
             from engine.vector import VectorStoreFactory
             from engine.vector.embedder import Embedder
@@ -70,15 +70,11 @@ class MengramBrain:
             print("🧠 Initializing semantic search...", file=sys.stderr)
             embedder = Embedder()
 
-            # Choose backend from config (default: sqlite)
-            backend_type = getattr(self, '_vector_backend', 'sqlite')
-            
             self._vector_store = VectorStoreFactory.create(
-                backend_type,
+                "sqlite",
                 db_path=self._vector_db_path,
                 embedder=embedder,
             )
-            print(f"   ✅ Using {backend_type} backend", file=sys.stderr)
 
             # Auto-sync: index only new/missing entities
             stats = self._vector_store.stats()
